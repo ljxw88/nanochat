@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=1 bash speedrun_conda.sh
