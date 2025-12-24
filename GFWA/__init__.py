@@ -1,0 +1,1 @@
+from .flash import attention as flash_attention # noqa: F401
