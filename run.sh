@@ -1,1 +1,1 @@
-CUDA_VISIBLE_DEVICES=1 bash speedrun_conda.sh
+CUDA_VISIBLE_DEVICES=1 WANDB_RUN=d26 bash speedrun_conda.sh
