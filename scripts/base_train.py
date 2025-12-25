@@ -20,6 +20,7 @@ import wandb
 import torch
 
 from nanochat.gpt import GPT, GPTConfig
+from nanochat.gpt_gated import GPTGated, GPTGatedConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader, tokenizing_distributed_data_loader_with_state
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -37,6 +38,12 @@ device_type = "" # cuda|cpu|mps (empty => autodetect good device type default, i
 # Model architecture
 depth = 20 # the depth of the Transformer model to train, rest of the kwargs are derived
 max_seq_len = 2048 # max context length
+model_variant = "vanilla" # "vanilla" or "gated" (GatedFWA with optional features)
+# GatedFWA-specific parameters (only used if model_variant == "gated")
+window_size = None # Sliding window size for attention (None = full attention)
+use_forgetting_gate = False # Whether to use data-dependent forgetting gate
+use_k_shift = False # Whether to use token shift on keys
+use_v_shift = False # Whether to use token shift on values
 # Training horizon. Only one of these 3 will be used, in this order of precedence.
 num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
 target_flops = -1.0 # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
@@ -111,9 +118,25 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 
 # Create a new model with random weights
 model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
+
+# Add GFWA-specific parameters if using gated model variant
+if model_variant == "gated":
+    model_config_kwargs.update({
+        'window_size': window_size,
+        'use_forgetting_gate': use_forgetting_gate,
+        'use_k_shift': use_k_shift,
+        'use_v_shift': use_v_shift,
+    })
+    print0(f"Using GatedFWA model variant with: window_size={window_size}, use_forgetting_gate={use_forgetting_gate}, use_k_shift={use_k_shift}, use_v_shift={use_v_shift}")
+
 with torch.device("meta"):
-    model_config = GPTConfig(**model_config_kwargs)
-    model = GPT(model_config)
+    if model_variant == "gated":
+        model_config = GPTGatedConfig(**model_config_kwargs)
+        model = GPTGated(model_config)
+    else:
+        model_config = GPTConfig(**model_config_kwargs)
+        model = GPT(model_config)
+
 model.to_empty(device=device)
 model.init_weights()
 

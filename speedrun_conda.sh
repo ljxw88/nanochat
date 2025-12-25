@@ -84,12 +84,36 @@ wait $DATASET_DOWNLOAD_PID
 # Number of processes/GPUs to use
 NPROC_PER_NODE=1
 
-# pretrain the d20 model
+# ===== OPTION 1: Vanilla GPT (Standard) =====
+# pretrain the d20 model with vanilla GPT
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --run=$WANDB_RUN
 # evaluate the model on a larger chunk of train/val data and draw some samples
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss
 # evaluate the model on CORE tasks
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval
+
+# ===== OPTION 2: GatedFWA with Sliding Window + Forgetting Gate =====
+# Uncomment below to train with GatedFWA instead of vanilla GPT.
+# This variant uses:
+#   - Sliding window attention (512 tokens)
+#   - Data-dependent forgetting gate
+#   - Token shift on keys and values
+# For more details, see scripts/config_gated_v1.py
+#
+# torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train scripts/config_gated_v1.py
+# torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss
+# torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval
+
+# ===== OPTION 3: Custom GatedFWA Configuration =====
+# You can also pass GatedFWA parameters directly on the command line:
+#
+# torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- \
+#     --depth=20 --model_variant=gated \
+#     --window_size=512 --use_forgetting_gate=True --use_k_shift=True --use_v_shift=True \
+#     --run=$WANDB_RUN
+
+# Note: To switch between vanilla and gated variants, make sure to use different
+# --model_tag values or checkpoint directories to avoid conflicts.
 
 # -----------------------------------------------------------------------------
 # Midtraining (teach the model conversation special tokens, tool use, multiple choice)
