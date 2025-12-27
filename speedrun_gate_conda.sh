@@ -85,7 +85,11 @@ wait $DATASET_DOWNLOAD_PID
 NPROC_PER_NODE=1
 
 # # pretrain the d20 model
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --run=$WANDB_RUN
+# torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --run=$WANDB_RUN
+torchrun --nproc_per_node=8 -m scripts.base_train -- \
+    --depth=20 --model_tag=d20_sw_gated --model_variant=gated \
+    --window_size=512 --use_forgetting_gate=True \
+    --use_k_shift=True --use_v_shift=True --run=$WANDB_RUN
 # evaluate the model on a larger chunk of train/val data and draw some samples
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss
 # evaluate the model on CORE tasks

@@ -10,6 +10,7 @@ import torch
 
 from nanochat.common import get_base_dir
 from nanochat.gpt import GPT, GPTConfig
+from nanochat.gpt_gated import GPTGated, GPTGatedConfig
 from nanochat.tokenizer import get_tokenizer
 from nanochat.common import setup_default_logging
 
@@ -75,9 +76,21 @@ def build_model(checkpoint_dir, step, device, phase):
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
     log0(f"Building model with config: {model_config_kwargs}")
-    model_config = GPTConfig(**model_config_kwargs)
-    with torch.device("meta"):
-        model = GPT(model_config)
+    
+    # Detect if this is a GatedFWA model by checking for gatedfwa-specific parameters
+    is_gated_model = any(key in model_config_kwargs for key in ['window_size', 'use_forgetting_gate', 'use_k_shift', 'use_v_shift'])
+    
+    if is_gated_model:
+        log0("Detected GatedFWA model, using GPTGatedConfig and GPTGated")
+        model_config = GPTGatedConfig(**model_config_kwargs)
+        with torch.device("meta"):
+            model = GPTGated(model_config)
+    else:
+        log0("Detected vanilla model, using GPTConfig and GPT")
+        model_config = GPTConfig(**model_config_kwargs)
+        with torch.device("meta"):
+            model = GPT(model_config)
+    
     # Load the model state
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
