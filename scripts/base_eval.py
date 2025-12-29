@@ -148,6 +148,8 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--hf-path', type=str, default=None, help='HuggingFace model path to evaluate')
+    parser.add_argument('--model-tag', type=str, default=None, help='Model tag to load from base_checkpoints (e.g., d20_sw_gated)')
+    parser.add_argument('--step', type=int, default=None, help='Step to load the model from (e.g., 1000)')
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per task to evaluate (-1 = disable)')
     args = parser.parse_args()
 
@@ -166,7 +168,7 @@ def main():
         model_slug = hf_path.replace("/", "-") # for the output csv file
     else:
         # load a local model from the file system
-        model, tokenizer, meta = load_model("base", device, phase="eval")
+        model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step)
         model_name = f"base_model (step {meta['step']})" # just for logging
         model_slug = f"base_model_{meta['step']:06d}" # for the output csv file
 

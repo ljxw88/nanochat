@@ -120,8 +120,18 @@ def find_largest_model(checkpoints_dir):
             model_depth = int(match.group(1))
             candidates.append((model_depth, model_tag))
     if candidates:
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates[0][1]
+        # Sort by depth (descending), then by name as secondary criterion
+        # This ensures deterministic behavior when multiple models have the same depth
+        # Prefer explicit naming: if there's a d20 and d20_gated, both will have depth 20
+        # In that case, prefer the one without extra suffixes (vanilla) first
+        candidates.sort(key=lambda x: (-x[0], x[1]))
+        selected = candidates[0][1]
+        if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+            # Multiple candidates with the same depth - log a warning
+            same_depth_models = [c[1] for c in candidates if c[0] == candidates[0][0]]
+            log0(f"Multiple models with depth {candidates[0][0]} found: {same_depth_models}")
+            log0(f"Selected: {selected} (use --model-tag to specify a different one)")
+        return selected
     # 2) if that failed, take the most recently updated model:
     model_tags.sort(key=lambda x: os.path.getmtime(os.path.join(checkpoints_dir, x)), reverse=True)
     return model_tags[0]

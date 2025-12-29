@@ -11,12 +11,37 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+    HAS_LIGER = True
+except ImportError:
+    HAS_LIGER = False
+
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
 from nanochat.token_shift import ShiftLinear
 from GFWA.flash import attention as flash_attention
 from functools import partial
+
+
+@torch.compiler.disable  # liger_kernel not compatible with torch.compile
+def _liger_fused_cross_entropy(weight, logits, targets, loss_reduction='mean'):
+    """Compute cross-entropy loss using liger_kernel's fused implementation."""
+    if not HAS_LIGER:
+        return F.cross_entropy(logits, targets, reduction=loss_reduction)
+    
+    loss_fn = LigerFusedLinearCrossEntropyLoss()
+    loss = loss_fn(weight, logits, targets)
+    
+    if loss_reduction == 'mean':
+        return loss.mean()
+    elif loss_reduction == 'sum':
+        return loss.sum()
+    elif loss_reduction == 'none':
+        return loss
+    else:
+        return loss.mean()
 
 
 @dataclass
@@ -107,6 +132,7 @@ class CausalSelfAttentionGated(nn.Module):
                 requires_grad=True
             )
     
+    @torch.compiler.disable  # GFWA flash attention uses torch.cuda.device_of() which is incompatible with torch.compile
     def forward(self, x, cos_sin, kv_cache, key_shift_state=None, value_shift_state=None):
         B, T, C = x.size()
         
@@ -131,12 +157,6 @@ class CausalSelfAttentionGated(nn.Module):
         q, k = norm(q), norm(k)  # QK norm
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         
-        # Handle KV cache
-        if kv_cache is not None:
-            k, v = kv_cache.insert_kv(self.layer_idx, k, v)
-        Tq = q.size(2)
-        Tk = k.size(2)
-        
         # Prepare forgetting gate if needed
         forgetting_gate = None
         if self.use_forgetting_gate:
@@ -150,6 +170,15 @@ class CausalSelfAttentionGated(nn.Module):
             forgetting_gate = F.logsigmoid(fgate_logit)
             forgetting_gate = forgetting_gate * (1.0 / (fgate_lambda + 1e-3))
         
+        # Handle KV cache
+        if kv_cache is not None:
+            if self.use_forgetting_gate:
+                k, v, forgetting_gate = kv_cache.insert_kv(self.layer_idx, k, v, forgetting_gate)
+            else:
+                k, v = kv_cache.insert_kv(self.layer_idx, k, v)
+        Tq = q.size(2)
+        Tk = k.size(2)
+
         # Attention computation
         q_orig_dtype = q.dtype
         attn_scale = 1.0 / math.sqrt(self.head_dim)
@@ -236,6 +265,13 @@ class GPTGated(nn.Module):
         for block in self.transformer.h:
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
+            
+            # Initialize forgetting gate to start in a "remembering" state
+            if hasattr(block.attn, 'fgate_proj') and block.attn.use_forgetting_gate:
+                # Small weights to minimize data dependence initially
+                torch.nn.init.normal_(block.attn.fgate_proj.weight, mean=0.0, std=0.02)
+                # Positive bias to keep gate open (sigmoid(2.0) ~= 0.88)
+                torch.nn.init.constant_(block.attn.fgate_proj.bias, 2.0)
         
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -287,25 +323,42 @@ class GPTGated(nn.Module):
         num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
         return num_flops_per_token
     
-    def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0):
-        """Setup optimizers: AdamW for embeddings/gates + Muon for matrix params."""
-        model_dim = self.config.n_embd
+    def setup_optimizers(self, unembedding_lr, embedding_lr, matrix_lr, weight_decay):
         ddp, rank, local_rank, world_size = get_dist_info()
         
-        # Separate parameters
-        matrix_params = list(self.transformer.h.parameters())
+        # 1. Collect GatedFWA forgetting gate params first
+        fgate_params = []
+        fgate_param_ids = set()
+        for block in self.transformer.h:
+            if hasattr(block.attn, 'fgate_proj') and block.attn.use_forgetting_gate:
+                for p in block.attn.fgate_proj.parameters():
+                    fgate_params.append(p)
+                    fgate_param_ids.add(id(p))
+            if hasattr(block.attn, 'weight_lambda') and block.attn.use_forgetting_gate:
+                fgate_params.append(block.attn.weight_lambda)
+                fgate_param_ids.add(id(block.attn.weight_lambda))
+
+        # 2. Separate remaining transformer parameters
+        all_transformer_params = list(self.transformer.h.parameters())
+        
+        # For Muon, we only want 2D parameters (weight matrices)
+        # CRITICAL FIX: Exclude fgate_params to prevent double optimization
+        matrix_params = [
+            p for p in all_transformer_params 
+            if p.ndim == 2 and id(p) not in fgate_param_ids
+        ]
+        
+        # Non-2D transformer params (biases, norms), excluding fgate_params
+        non_matrix_params = [
+            p for p in all_transformer_params 
+            if p.ndim != 2 and id(p) not in fgate_param_ids
+        ]
+        
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         
-        # For GatedFWA, add forgetting gate params to AdamW group
-        fgate_params = []
-        for block in self.transformer.h:
-            if hasattr(block.attn, 'fgate_proj') and block.attn.use_forgetting_gate:
-                fgate_params.extend(block.attn.fgate_proj.parameters())
-            if hasattr(block.attn, 'weight_lambda') and block.attn.use_forgetting_gate:
-                fgate_params.append(block.attn.weight_lambda)
-        
-        # Create AdamW for embeddings, lm_head, and forgetting gate
+        # Create AdamW groups
+        model_dim = self.config.n_embd
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
         
@@ -313,27 +366,36 @@ class GPTGated(nn.Module):
             dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
             dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
         ]
-        if fgate_params:
+        
+        if non_matrix_params:
             adam_groups.append(
-                dict(params=fgate_params, lr=embedding_lr * dmodel_lr_scale)
+                dict(params=non_matrix_params, lr=embedding_lr * dmodel_lr_scale)
             )
         
-        adamw_kwargs = dict(betas=(0.8, 0.95), eps=1e-10, weight_decay=weight_decay)
+        if fgate_params:
+            # CRITICAL FIX: Use unembedding_lr (0.004) instead of embedding_lr (0.2)
+            # 0.2 is too high for internal dense projections
+            adam_groups.append(
+                dict(params=fgate_params, lr=unembedding_lr * dmodel_lr_scale)
+            )
+
+        # Create AdamW optimizer
+        adamw_kwargs = dict(weight_decay=weight_decay, betas=(0.9, 0.95))
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
         adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
         
-        # Create Muon for matrix parameters
+        # Create Muon for matrix parameters (2D only)
         muon_kwargs = dict(lr=matrix_lr, momentum=0.95)
         MuonFactory = DistMuon if ddp else Muon
         muon_optimizer = MuonFactory(matrix_params, **muon_kwargs)
         
-        # Combine optimizers
-        optimizers = [adamw_optimizer, muon_optimizer]
-        for opt in optimizers:
+        # Set initial_lr for LR scheduling
+        for opt in [adamw_optimizer, muon_optimizer]:
             for group in opt.param_groups:
-                group["initial_lr"] = group["lr"]
+                group['initial_lr'] = group['lr']
         
-        return optimizers
+        return adamw_optimizer, muon_optimizer
+
     
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         """Forward pass through the model."""
@@ -369,23 +431,32 @@ class GPTGated(nn.Module):
         
         x = norm(x)
         
-        # Output
+        # Compute loss if targets provided (before softcap, using liger_kernel for memory efficiency)
+        if targets is not None:
+            # Reshape for loss computation
+            B, T, C = x.shape
+            x_flat = x.view(-1, C)  # (B*T, C)
+            targets_flat = targets.view(-1)   # (B*T,)
+            # Filter out ignore_index=-1
+            valid_mask = targets_flat != -1
+            if valid_mask.any():
+                loss = _liger_fused_cross_entropy(
+                    self.lm_head.weight,
+                    x_flat[valid_mask],
+                    targets_flat[valid_mask],
+                    loss_reduction=loss_reduction
+                )
+            else:
+                loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+            return loss
+        
+        # Output (inference: return logits)
         softcap = 15
         logits = self.lm_head(x)
         logits = logits[..., :self.config.vocab_size]
         logits = logits.float()
         logits = softcap * torch.tanh(logits / softcap)
-        
-        if targets is not None:
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=-1,
-                reduction=loss_reduction
-            )
-            return loss
-        else:
-            return logits
+        return logits
     
     def _init_shift_states(self, batch_size):
         """Initialize shift states for token shift during generation."""

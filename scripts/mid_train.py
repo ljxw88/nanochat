@@ -35,6 +35,7 @@ run = "dummy" # wandb run name default ("dummy" is special - we won't log to wan
 device_type = "" # cuda|cpu|mps (empty => autodetect)
 model_tag = None # model tag to load the model from (base model or midtrained model)
 step = None # step to load the model from (base model or midtrained model)
+output_tag = None # optional output tag for the checkpoint directory name (defaults to d{depth} if not specified)
 dtype = "bfloat16"
 num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
 max_seq_len = 2048
@@ -207,8 +208,10 @@ while True:
 
     # save checkpoint at the end of the run (only on master process)
     if master_process and last_step and not dry_run:
-        output_dirname = f"d{depth}" # e.g. d12
+        output_dirname = output_tag if output_tag else f"d{depth}" # use output_tag if specified, otherwise default to d{depth}
         checkpoint_dir = os.path.join(base_dir, "mid_checkpoints", output_dirname)
+        # Preserve the original model_config from the base model (includes any gatedfwa parameters)
+        model_config = meta.get("model_config", {})
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -217,14 +220,7 @@ while True:
             {
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
-                "model_config": {
-                    "sequence_len": max_seq_len,
-                    "vocab_size": tokenizer.get_vocab_size(),
-                    "n_layer": depth,
-                    "n_head": model.config.n_head,
-                    "n_kv_head": model.config.n_kv_head,
-                    "n_embd": model.config.n_embd,
-                },
+                "model_config": model_config,
                 "user_config": user_config, # inputs to the training script
             }
         )

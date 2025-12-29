@@ -19,9 +19,35 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+    HAS_LIGER = True
+except ImportError:
+    HAS_LIGER = False
+
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
+
+@torch.compiler.disable  # liger_kernel not compatible with torch.compile
+def _liger_fused_cross_entropy(weight, logits, targets, loss_reduction='mean'):
+    """Compute cross-entropy loss using liger_kernel's fused implementation."""
+    if not HAS_LIGER:
+        # Fallback: compute linear projection then cross entropy
+        # logits here is actually the input to the linear layer
+        return F.cross_entropy(F.linear(logits, weight), targets, reduction=loss_reduction)
+    
+    loss_fn = LigerFusedLinearCrossEntropyLoss()
+    loss = loss_fn(weight, logits, targets)
+    
+    if loss_reduction == 'mean':
+        return loss.mean()
+    elif loss_reduction == 'sum':
+        return loss.sum()
+    elif loss_reduction == 'none':
+        return loss
+    else:
+        return loss.mean()
 
 @dataclass
 class GPTConfig:
@@ -262,21 +288,32 @@ class GPT(nn.Module):
             x = block(x, cos_sin, kv_cache)
         x = norm(x)
 
+        if targets is not None:
+            # training: given the targets, compute and return the loss
+            # Reshape for loss computation
+            B, T, C = x.shape
+            x_flat = x.view(-1, C)  # (B*T, C)
+            targets_flat = targets.view(-1)   # (B*T,)
+            # Filter out ignore_index=-1
+            valid_mask = targets_flat != -1
+            if valid_mask.any():
+                loss = _liger_fused_cross_entropy(
+                    self.lm_head.weight,
+                    x_flat[valid_mask],
+                    targets_flat[valid_mask],
+                    loss_reduction=loss_reduction
+                )
+            else:
+                loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+            return loss
+
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
         logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
-
-        if targets is not None:
-            # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            return loss
-        else:
-            # inference: just return the logits directly
-            return logits
+        return logits
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):

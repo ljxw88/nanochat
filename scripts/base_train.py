@@ -95,8 +95,9 @@ print0(f"Vocab size: {vocab_size:,}")
 
 # Model kwargs are derived from the desired depth of the model
 num_layers = depth
-model_dim = depth * 64 # aspect ratio 64 (usually this is varied from 64 -> 128 as model size increases)
-num_heads = max(1, (model_dim + 127) // 128) # head dim 128 (the division here is ceil div)
+# model_dim = depth * 64 # aspect ratio 64 (usually this is varied from 64 -> 128 as model size increases)
+model_dim = 1536
+num_heads = 24
 num_kv_heads = num_heads # default is 1:1 GQA (Group Query Attention) ratio (i.e. GQA is disabled)
 print0(f"num_layers: {num_layers}")
 print0(f"model_dim: {model_dim}")
@@ -152,10 +153,14 @@ if resuming:
     del model_data # free up this memory after the copy
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
+# Compile model for both vanilla and gated models
+# For gated models, the Attention.forward method has @torch.compiler.disable to skip GFWA flash attention
 model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
-num_params = sum(p.numel() for p in model.parameters())
+if model_variant == "gated":
+    print0("Compiling GatedFWA model (with @torch.compiler.disable on Attention.forward for flash attention compatibility)")
+num_params = sum(p.numel() for p in orig_model.parameters())
 print0(f"Number of parameters: {num_params:,}")
-num_flops_per_token = model.estimate_flops()
+num_flops_per_token = orig_model.estimate_flops()
 print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
 # Calculate number of iterations. Either it is given, or from target flops, or from target data:param ratio (in that order)

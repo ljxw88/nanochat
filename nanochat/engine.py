@@ -86,11 +86,14 @@ class KVCache:
     Note that the .pos advances automatically after the last layer of the Transformer inserts.
     """
 
-    def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers):
+    def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers, use_forgetting_gate=False):
         # Each of K/V is of shape (B, H, T, D) and we have one per layer of the Transformer.
         self.kv_shape = (num_layers, 2, batch_size, num_heads, seq_len, head_dim)
         self.kv_cache = None
         self.pos = 0 # current position in time in the cache
+        self.use_forgetting_gate = use_forgetting_gate
+        self.fgate_shape = (num_layers, batch_size, num_heads, seq_len) if use_forgetting_gate else None
+        self.fgate_cache = None
 
     def reset(self):
         self.pos = 0
@@ -129,13 +132,22 @@ class KVCache:
         self.kv_cache = torch.empty(self.kv_shape, dtype=dtype, device=device)
         # 3) copy the data over
         self.kv_cache[:, :, :, :, :other.pos, :] = other.kv_cache
+        if self.use_forgetting_gate:
+            assert other.use_forgetting_gate
+            if self.fgate_cache is None:
+                self.fgate_cache = torch.empty(self.fgate_shape, dtype=other.fgate_cache.dtype, device=other.fgate_cache.device)
+            self.fgate_cache[:, :, :, :other.pos] = other.fgate_cache
+
         # 4) update the pos
         self.pos = other.pos
 
-    def insert_kv(self, layer_idx, k, v):
+    def insert_kv(self, layer_idx, k, v, log_fgate=None):
         # Lazy initialize the cache here because we need to know the dtype/device
         if self.kv_cache is None:
             self.kv_cache = torch.empty(self.kv_shape, dtype=k.dtype, device=k.device)
+        if self.use_forgetting_gate and self.fgate_cache is None and log_fgate is not None:
+            self.fgate_cache = torch.empty(self.fgate_shape, dtype=log_fgate.dtype, device=log_fgate.device)
+
         # Insert new keys/values to the cache and return the full cache so far
         B, H, T_add, D = k.size()
         t0, t1 = self.pos, self.pos + T_add
@@ -148,15 +160,32 @@ class KVCache:
             additional_cache = torch.empty(additional_shape, dtype=k.dtype, device=k.device)
             self.kv_cache = torch.cat([self.kv_cache, additional_cache], dim=4).contiguous()
             self.kv_shape = self.kv_cache.shape
+            
+            if self.use_forgetting_gate and self.fgate_cache is not None:
+                additional_shape_fg = list(self.fgate_cache.shape)
+                additional_shape_fg[3] = t_needed - self.fgate_cache.size(3)
+                additional_fg = torch.empty(additional_shape_fg, dtype=self.fgate_cache.dtype, device=self.fgate_cache.device)
+                self.fgate_cache = torch.cat([self.fgate_cache, additional_fg], dim=3).contiguous()
+                self.fgate_shape = self.fgate_cache.shape
+
         # Insert k, v into the cache
         self.kv_cache[layer_idx, 0, :, :, t0:t1, :] = k
         self.kv_cache[layer_idx, 1, :, :, t0:t1, :] = v
+        if self.use_forgetting_gate and log_fgate is not None:
+            self.fgate_cache[layer_idx, :, :, t0:t1] = log_fgate
+
         # Return the full cached keys/values up to current position (as a view)
         key_view = self.kv_cache[layer_idx, 0, :, :, :t1, :]
         value_view = self.kv_cache[layer_idx, 1, :, :, :t1, :]
+        if self.use_forgetting_gate:
+            fgate_view = self.fgate_cache[layer_idx, :, :, :t1]
+
         # Increment pos after the last layer of the Transformer processes
         if layer_idx == self.kv_cache.size(0) - 1:
             self.pos = t1
+        
+        if self.use_forgetting_gate:
+            return key_view, value_view, fgate_view
         return key_view, value_view
 
 
@@ -215,7 +244,12 @@ class Engine:
 
         # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
-        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
+        kv_model_kwargs = {
+            "num_heads": m.n_kv_head, 
+            "head_dim": m.n_embd // m.n_head, 
+            "num_layers": m.n_layer,
+            "use_forgetting_gate": getattr(m, 'use_forgetting_gate', False)
+        }
         kv_cache_prefill = KVCache(
             batch_size=1,
             seq_len=len(tokens),

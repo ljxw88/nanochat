@@ -14,72 +14,72 @@
 export OMP_NUM_THREADS=1
 # export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 export NANOCHAT_BASE_DIR="/data/models/nanochat"
-mkdir -p $NANOCHAT_BASE_DIR
+# mkdir -p $NANOCHAT_BASE_DIR
 
-# -----------------------------------------------------------------------------
-# Python conda setup
+# # -----------------------------------------------------------------------------
+# # Python conda setup
 
-# create a conda environment (if it doesn't exist)
-conda env list | grep nanochat &> /dev/null || conda create -n nanochat python=3.11 -y
-# activate conda environment
-conda activate nanochat
-# install the repo dependencies
-pip install -e ".[gpu]"
+# # create a conda environment (if it doesn't exist)
+# conda env list | grep nanochat &> /dev/null || conda create -n nanochat python=3.11 -y
+# # activate conda environment
+# conda activate nanochat
+# # install the repo dependencies
+# pip install -e ".[gpu]"
 
-# -----------------------------------------------------------------------------
-# wandb setup
-# If you wish to use wandb for logging (it's nice!, recommended).
-# 1) Make sure to first log in to wandb, e.g. run:
-#    `wandb login`
-# 2) Set the WANDB_RUN environment variable when running this script, e.g.:
-#    `WANDB_RUN=d26 bash speedrun.sh`
-if [ -z "$WANDB_RUN" ]; then
-    # by default use "dummy" : it's handled as a special case, skips logging to wandb
-    WANDB_RUN=dummy
-fi
+# # -----------------------------------------------------------------------------
+# # wandb setup
+# # If you wish to use wandb for logging (it's nice!, recommended).
+# # 1) Make sure to first log in to wandb, e.g. run:
+# #    `wandb login`
+# # 2) Set the WANDB_RUN environment variable when running this script, e.g.:
+# #    `WANDB_RUN=d26 bash speedrun.sh`
+# if [ -z "$WANDB_RUN" ]; then
+#     # by default use "dummy" : it's handled as a special case, skips logging to wandb
+#     WANDB_RUN=dummy
+# fi
 
-# -----------------------------------------------------------------------------
-# During the course of the run, we will be writing markdown reports to the report/
-# directory in the base dir. This command clears it out and writes a header section
-# with a bunch of system info and a timestamp that marks the start of the run.
-python -m nanochat.report reset
+# # -----------------------------------------------------------------------------
+# # During the course of the run, we will be writing markdown reports to the report/
+# # directory in the base dir. This command clears it out and writes a header section
+# # with a bunch of system info and a timestamp that marks the start of the run.
+# python -m nanochat.report reset
 
-# -----------------------------------------------------------------------------
-# Tokenizer
+# # -----------------------------------------------------------------------------
+# # Tokenizer
 
-# Install Rust / Cargo
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
+# # Install Rust / Cargo
+# curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+# source "$HOME/.cargo/env"
 
-# Build the rustbpe Tokenizer
-maturin develop --release --manifest-path rustbpe/Cargo.toml
+# # Build the rustbpe Tokenizer
+# maturin develop --release --manifest-path rustbpe/Cargo.toml
 
-# Download the first ~2B characters of pretraining dataset
-# look at dev/repackage_data_reference.py for details on how this data was prepared
-# each data shard is ~250M chars
-# so we download 2e9 / 250e6 = 8 data shards at this point
-# each shard is ~100MB of text (compressed), so this is about ~800MB of data on disk
-python -m nanochat.dataset -n 8
-# Immediately also kick off downloading more shards in the background while tokenizer trains
-# See comment below for why 240 is the right number here
-python -m nanochat.dataset -n 240 &
-DATASET_DOWNLOAD_PID=$!
-# train the tokenizer with vocab size 2**16 = 65536 on ~2B characters of data
-python -m scripts.tok_train --max_chars=2000000000
-# evaluate the tokenizer (report compression ratio etc.)
-python -m scripts.tok_eval
+# # Download the first ~2B characters of pretraining dataset
+# # look at dev/repackage_data_reference.py for details on how this data was prepared
+# # each data shard is ~250M chars
+# # so we download 2e9 / 250e6 = 8 data shards at this point
+# # each shard is ~100MB of text (compressed), so this is about ~800MB of data on disk
+# python -m nanochat.dataset -n 8
+# # Immediately also kick off downloading more shards in the background while tokenizer trains
+# # See comment below for why 240 is the right number here
+# python -m nanochat.dataset -n 240 &
+# DATASET_DOWNLOAD_PID=$!
+# # train the tokenizer with vocab size 2**16 = 65536 on ~2B characters of data
+# python -m scripts.tok_train --max_chars=2000000000
+# # evaluate the tokenizer (report compression ratio etc.)
+# python -m scripts.tok_eval
 
-# -----------------------------------------------------------------------------
-# Base model (pretraining)
+# # -----------------------------------------------------------------------------
+# # Base model (pretraining)
 
-# The d20 model is 561M parameters.
-# Chinchilla says #tokens = 20X #params, so we need 561e6 * 20 = 11.2B tokens.
-# Assume our tokenizer is 4.8 chars/token, this is 11.2B * 4.8 ~= 54B chars.
-# At 250M chars/shard, this is 54B / 250M ~= 216 shards needed for pretraining.
-# Round up to 240 for safety. At ~100MB/shard, this downloads ~24GB of data to disk.
-# (The total number of shards available in the entire dataset is 1822.)
-echo "Waiting for dataset download to complete..."
-wait $DATASET_DOWNLOAD_PID
+# # The d20 model is 561M parameters.
+# # Chinchilla says #tokens = 20X #params, so we need 561e6 * 20 = 11.2B tokens.
+# # Assume our tokenizer is 4.8 chars/token, this is 11.2B * 4.8 ~= 54B chars.
+# # At 250M chars/shard, this is 54B / 250M ~= 216 shards needed for pretraining.
+# # Round up to 240 for safety. At ~100MB/shard, this downloads ~24GB of data to disk.
+# # (The total number of shards available in the entire dataset is 1822.)
+# echo "Waiting for dataset download to complete..."
+# wait $DATASET_DOWNLOAD_PID
 
 # Number of processes/GPUs to use
 NPROC_PER_NODE=1
